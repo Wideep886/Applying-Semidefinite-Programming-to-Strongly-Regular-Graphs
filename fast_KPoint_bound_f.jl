@@ -1,3 +1,12 @@
+# fast_KPoint_bound_f_re_1.jl — strict exact fork (no Float64 eigen fallback)
+#
+# SRG(28,9,0,4) fix: rank-deficient Gram → semidefinite pivot pcholesky (exact Arb);
+#   if that fails → QQBar char-poly eigen embedding (algebraic exact).
+# get_grid_index: snap dot-products to exact D_ext (no loose tolerance).
+#
+#   julia --startup-file=no fast_KPoint_bound_f_re_1.jl diagnose
+#   julia --startup-file=no -e 'include("fast_KPoint_bound_f_re_1.jl"); using .FastKPointBoundFRe1; ...'
+#
 # fast_KPoint_bound_f.jl — k-point SDP bound (feasible-state quotient form)
 #
 # Based on the Julia scripts of de Laat et al. (KPointBound.txt; arXiv:1812.06045).
@@ -45,23 +54,23 @@
 # Please cite de Laat et al. (2022) when using this workflow.
 #
 
-module FastKPointBoundF
+module FastKPointBoundFRe1
 
 using LinearAlgebra, Nemo, Combinatorics, IterTools, Printf
 
 export build_kpoint_template, fill_kpoint_sdp, compress_kpoint_sdp, solve_kpoint_sdp, solve_k_point_bound
 export SDPAGMPOptions, default_sdpa_gmp_path, run_example!, KPointTemplate
 export prepare_kpoint_sdp, inspect_kpoint_sdp!, KPointBuildReport
+export diagnose_D, diagnose_srg_280904, psd_embedding
 
 const arb = Nemo.ArbFieldElem
 
 # Default example (used when running this file directly)
-const EXAMPLE_N = 37
+const EXAMPLE_N = 7
 const EXAMPLE_K = 5
-const EXAMPLE_DEG = 2
-const EXAMPLE_INNER_A = -5 // 52
-const EXAMPLE_INNER_B = 7 // 26
-
+const EXAMPLE_DEG = 5
+const EXAMPLE_INNER_A = -3 // 80
+const EXAMPLE_INNER_B = 2 // 70
 # Numerical defaults (see file header)
 const ARB_PREC = 2500
 const SDPA_PRECISION = 1500
@@ -144,6 +153,7 @@ function orbitequal(Q1::Vector{Vector{T}}, Q2::Vector{Vector{T}}) where T
     )
 end
 
+"""Pivot Cholesky for positive-definite matrices (full rank)."""
 function pcholesky(A)
     A = deepcopy(A)
     n = size(A, 1)
@@ -170,6 +180,268 @@ function pcholesky(A)
     true, A, p
 end
 
+"""Finite check for Arb scalars."""
+function arb_isfinite(x::arb)
+    v = Float64(x)
+    isfinite(v) && !isnan(v)
+end
+
+"""Snap Gram entries to exact values in D_ext = {D..., 1}."""
+function snap_gram_to_D_ext(Marb::Matrix{arb}, D_ext::Vector{arb}, tol::arb)
+    out = Matrix{arb}(undef, size(Marb)...)
+    for i in 1:size(Marb, 1), j in 1:size(Marb, 2)
+        v = Marb[i, j]
+        matched = false
+        for d in D_ext
+            if abs(v - d) <= tol
+                out[i, j] = d
+                matched = true
+                break
+            end
+        end
+        matched || (out[i, j] = v)
+    end
+    out
+end
+
+"""
+Semidefinite pivot Cholesky: stop when remaining pivot ≤ `pivot_tol`.
+Returns `(rank, F, p)` where columns `1:rank` of `F` give an exact low-rank factor
+`G ≈ F[:,1:rank]*F[:,1:rank]'` for PSD Gram matrices with rational Arb entries.
+"""
+function psd_pcholesky(A::Matrix{arb}; pivot_tol::arb)
+    A = deepcopy(A)
+    n = size(A, 1)
+    p = collect(1:n)
+    rank = 0
+    for k in 1:n
+        d = [A[i, i] for i in k:n]
+        val, s = findmax(d)
+        s = s + k - 1
+        val <= pivot_tol && break
+        if s != k
+            A[:, [k, s]] = A[:, [s, k]]
+            A[[k, s], :] = A[[s, k], :]
+            p[[k, s]] = p[[s, k]]
+        end
+        A[k, k] = sqrt(A[k, k])
+        !arb_isfinite(A[k, k]) && break
+        rank += 1
+        k == n && break
+        A[k, k + 1:n] = A[k, k + 1:n] ./ A[k, k]
+        j = (k + 1):n
+        A[j, j] = A[j, j] .- A[k, j] .* transpose(A[k, j])
+    end
+    for i in 1:n, j in 1:i - 1
+        A[i, j] = zero(A[i, j])
+    end
+    rank, A, p
+end
+
+"""Verify `pts` (rows) reproduce `G` in Arb ball arithmetic."""
+function verify_gram_pts(pts::Vector{Vector{arb}}, G::Matrix{arb}, tol::arb)
+    card = length(pts)
+    for i in 1:card, j in 1:card
+        g = sum(pts[i][r] * pts[j][r] for r in 1:length(pts[i]))
+        abs(g - G[i, j]) > tol && return false
+    end
+    true
+end
+
+"""Map snapped Arb Gram entry to Rational{Int} via D_ext lookup."""
+function arb_to_rational_in_D_ext(v::arb, D_ext::Vector{arb}, D_rat::Vector{Rational{Int}}, tol::arb)
+    for (k, d) in enumerate(D_ext)
+        abs(v - d) <= tol && return D_rat[k]
+    end
+    nothing
+end
+
+function gram_to_rational(Marb::Matrix{arb}, D_ext::Vector{arb}, D_rat::Vector{Rational{Int}}, tol::arb)
+    n = size(Marb, 1)
+    Mr = Matrix{Rational{Int}}(undef, n, n)
+    for i in 1:n, j in 1:n
+        r = arb_to_rational_in_D_ext(Marb[i, j], D_ext, D_rat, tol)
+        r === nothing && return nothing
+        Mr[i, j] = r
+    end
+    Mr
+end
+
+"""Exact nullspace over QQBar via row-reduction."""
+function nullspace_qqbar(Mlam)
+    Rbar = QQBarField()
+    n = nrows(Mlam)
+    m = ncols(Mlam)
+    A = [deepcopy(Mlam[i, j]) for i in 1:n, j in 1:m]
+    pivot_cols = Int[]
+    row = 1
+    for col in 1:m
+        piv = 0
+        for r in row:n
+            if !iszero(A[r, col])
+                piv = r
+                break
+            end
+        end
+        piv == 0 && continue
+        A[row, :], A[piv, :] = A[piv, :], A[row, :]
+        invp = inv(A[row, col])
+        for c in 1:m
+            A[row, c] *= invp
+        end
+        for r in 1:n
+            r == row && continue
+            if !iszero(A[r, col])
+                f = A[r, col]
+                for c in 1:m
+                    A[r, c] -= f * A[row, c]
+                end
+            end
+        end
+        push!(pivot_cols, col)
+        row += 1
+        row > n && break
+    end
+    free_cols = setdiff(1:m, pivot_cols)
+    vecs = Vector{QQBarFieldElem}[]
+    for fc in free_cols
+        v = Vector{QQBarFieldElem}(undef, m)
+        for j in 1:m
+            v[j] = fc == j ? one(Rbar) : zero(Rbar)
+        end
+        for (ri, pc) in enumerate(pivot_cols)
+            s = zero(Rbar)
+            for j in (pc + 1):m
+                s += A[ri, j] * v[j]
+            end
+            v[pc] = -s
+        end
+        push!(vecs, v)
+    end
+    vecs
+end
+
+"""Positive roots of factor `f^exp` in QQBar (exact algebraic)."""
+function positive_qqbar_roots(f, exp::Int, Rbar::QQBarField)
+    degf = degree(f)
+    degf == 0 && return QQBarFieldElem[]
+    out = QQBarFieldElem[]
+    if degf == 1
+        cfs = collect(coefficients(f))
+        lam = -cfs[1] / cfs[2]
+        for _ in 1:exp
+            iszero(lam) && continue
+            z = Rbar(lam)
+            sign(real(z)) > 0 && push!(out, z)
+        end
+    else
+        for r in roots(Rbar, f)
+            for _ in 1:exp
+                sign(real(r)) > 0 && push!(out, r)
+            end
+        end
+    end
+    out
+end
+
+"""QQBar eigen embedding for rational Gram (char-poly factorization)."""
+function qqbar_psd_embedding(Mr::Matrix{Rational{Int}})
+    Rbar = QQBarField()
+    n = size(Mr, 1)
+    Rqq = QQField()
+    Mrq = matrix(Rqq, Mr)
+    S, x = polynomial_ring(Rqq, "x")
+    A = zero_matrix(S, n, n)
+    for i in 1:n, j in 1:n
+        A[i, j] = Mrq[i, j] - (i == j ? x : 0)
+    end
+    cp = det(A)
+    all_lams = QQBarFieldElem[]
+    for (f, exp) in factor(cp)
+        append!(all_lams, positive_qqbar_roots(f, exp, Rbar))
+    end
+    isempty(all_lams) && error("qqbar_psd_embedding: no positive eigenvalues")
+    embed_cols = Vector{Vector{QQBarFieldElem}}()
+    i = 1
+    while i <= length(all_lams)
+        lam = all_lams[i]
+        mult = 1
+        while i + mult <= length(all_lams) && all_lams[i + mult] == lam
+            mult += 1
+        end
+        Mlam = matrix(Rbar, [Mr[i, j] - (i == j ? lam : 0) for i in 1:n, j in 1:n])
+        ns = nullspace_qqbar(Mlam)
+        length(ns) < mult &&
+            error("qqbar_psd_embedding: eigenspace dim $(length(ns)) < mult $mult for λ=$lam")
+        sr = sqrt(lam)
+        for vi in 1:mult
+            v = ns[vi]
+            nv = sqrt(sum(vj^2 for vj in v))
+            v = [vj / nv for vj in v]
+            col = Vector{QQBarFieldElem}(undef, n)
+            for j in 1:n
+                col[j] = sr * v[j]
+            end
+            push!(embed_cols, col)
+        end
+        i += mult
+    end
+    rnk = length(embed_cols)
+    W = Matrix{QQBarFieldElem}(undef, n, rnk)
+    for c in 1:rnk, i in 1:n
+        W[i, c] = embed_cols[c][i]
+    end
+    W, rnk
+end
+
+function qqbar_to_arb_pts(R::ArbField, W::Matrix{QQBarFieldElem}, n::Int, rank::Int)
+    [[R(W[i, c]) for c in 1:rank] for i in 1:n]
+end
+
+"""Column vectors from upper-triangular Cholesky factor (de Laat convention)."""
+function pts_from_upper_cholesky(F::Matrix{arb}, rank::Int, card::Int)
+    [[F[r, c] for r in 1:rank] for c in 1:card]
+end
+
+"""Column vectors from lower-triangular libflint Cholesky (G = L L')."""
+function pts_from_lower_cholesky(L::Matrix{arb}, card::Int)
+    n = size(L, 1)
+    [[L[c, r] for r in 1:n] for c in 1:card]
+end
+
+"""Factor PSD Gram into `card` point vectors; exact Arb / QQBar only."""
+function psd_embedding(Marb::Matrix{arb}, D_ext::Vector{arb}, D_rat::Vector{Rational{Int}}, tol::arb)
+    card = size(Marb, 1)
+    Marb = snap_gram_to_D_ext(Marb, D_ext, tol)
+    R = parent(Marb[1, 1])
+
+    # 1. Semidefinite pivot Cholesky (handles rank < card)
+    rank, F, _ = psd_pcholesky(Marb; pivot_tol = tol)
+    if rank > 0
+        pts = pts_from_upper_cholesky(F, rank, card)
+        if all(all(arb_isfinite, v) for v in pts) && verify_gram_pts(pts, Marb, tol)
+            return pts
+        end
+    end
+
+    # 2. libflint Cholesky (often better for full-rank PSD)
+    s, Lraw = arbcholesky(Marb)
+    if s == 1
+        L = Lraw isa Matrix{arb} ? Lraw : Matrix(Lraw)
+        pts = pts_from_lower_cholesky(L, card)
+        if all(all(arb_isfinite, v) for v in pts) && verify_gram_pts(pts, Marb, tol)
+            return pts
+        end
+    end
+
+    # 3. QQBar char-poly eigen embedding (exact algebraic)
+    Mr = gram_to_rational(Marb, D_ext, D_rat, tol)
+    Mr === nothing && return nothing
+    W, rnk = qqbar_psd_embedding(Mr)
+    pts = qqbar_to_arb_pts(R, W, card, rnk)
+    all(all(arb_isfinite, v) for v in pts) && verify_gram_pts(pts, Marb, tol) ? pts : nothing
+end
+
 """Upper-triangular lex-min signature for a Gram matrix orbit."""
 function gram_orbit_signature(M::Matrix{Float64})
     n = size(M, 1)
@@ -188,9 +460,11 @@ Enumerate two-distance independent-set orbits R (de Laat).
 For |R|=card there are 2^C(card,2) inner-product patterns; card=6 gives 2^15 configs.
 Uses Float64 orbit signatures instead of Arb Set deduplication for speed at k=6.
 """
-function independentsets(n::Int, card::Int, innerproducts::Vector)
+function independentsets(n::Int, card::Int, innerproducts::Vector, D_rat::Vector{Rational{Int}})
     @assert n >= card
     R = parent(innerproducts[1])
+    D_ext = build_D_ext(innerproducts)
+    tol_embed = R("1e-18")
     ip = [Float64(x) for x in innerproducts]
     seen = Set{Tuple{Vararg{Float64}}}()
     out = Vector{Vector{arb}}[]
@@ -243,8 +517,8 @@ function independentsets(n::Int, card::Int, innerproducts::Vector)
                 j = i
             end
         end
-        ok, F, _ = pcholesky(Marb)
-        ok && push!(out, [[F[r, c] for r in 1:size(F, 2)] for c in 1:card])
+        pts = psd_embedding(Marb, D_ext, D_rat, tol_embed)
+        pts === nothing || push!(out, pts)
     end
     report && println(stderr)
     out
@@ -322,17 +596,25 @@ function build_D_ext(D::Vector{arb})
     ext
 end
 
+"""Index of v in D_ext (strict Arb tolerance)."""
+function match_D_ext_index(v::arb, D_ext::Vector{arb}, tol::arb)
+    for k in 1:length(D_ext)
+        abs(v - D_ext[k]) <= tol && return k
+    end
+    0
+end
+
+"""Snap v to the matching D_ext entry when within tolerance."""
+function snap_to_D_ext(v::arb, D_ext::Vector{arb}, tol::arb)
+    k = match_D_ext_index(v, D_ext, tol)
+    k == 0 ? v : D_ext[k]
+end
+
 function get_grid_index(mx::Vector{arb}, D_ext::Vector{arb}, tol::arb)
     idx = 1
     len_D = length(D_ext)
     for i in 1:length(mx)
-        match_k = 0
-        for k in 1:len_D
-            if abs(mx[i] - D_ext[k]) < tol
-                match_k = k
-                break
-            end
-        end
+        match_k = match_D_ext_index(mx[i], D_ext, tol)
         match_k == 0 && error("get_grid_index: value $(mx[i]) not in D_ext")
         idx += (match_k - 1) * len_D^(i - 1)
     end
@@ -348,13 +630,7 @@ function build_grid_to_U(U::Vector{Vector{arb}}, D_ext::Vector{arb}, tol::arb)
     for (i, u) in enumerate(U)
         idx = 1
         for j in 1:m
-            match_k = 0
-            for k in 1:len_D
-                if abs(u[j] - D_ext[k]) < tol
-                    match_k = k
-                    break
-                end
-            end
+            match_k = match_D_ext_index(u[j], D_ext, tol)
             match_k == 0 && error("build_grid_to_U: state coord not in D_ext")
             idx += (match_k - 1) * len_D^(j - 1)
         end
@@ -452,8 +728,8 @@ function fcal_U_accumulate!(
     invnf = inv(geom.nf)
     t = dot(x, y)
     for p in geom.perms
-        mx = [dot(geom.AR[:, p[k]], x) for k in 1:geom.m]
-        my = [dot(geom.AR[:, p[k]], y) for k in 1:geom.m]
+        mx = [snap_to_D_ext(dot(geom.AR[:, p[k]], x), D_ext, tol) for k in 1:geom.m]
+        my = [snap_to_D_ext(dot(geom.AR[:, p[k]], y), D_ext, tol) for k in 1:geom.m]
         gix = get_grid_index(mx, D_ext, tol)
         giy = get_grid_index(my, D_ext, tol)
         haskey(gmap, gix) && haskey(gmap, giy) || continue
@@ -538,6 +814,8 @@ end
 """Stage A: enumerate U_R, Remark 4.8 dimensions, constraint recipes (independent of n)."""
 function build_kpoint_template(k::Int, d::Int, D::Vector; prec::Int = ARB_PREC, verbose::Bool = true)
     Field = ArbField(prec)
+    D_rat = [Rational(a) for a in D]
+    D_ext_rat = vcat(D_rat, Rational(1))
     D = [Field(a) for a in D]
     D_ext = build_D_ext(D)
     tol = Field("1e-18")
@@ -553,7 +831,7 @@ function build_kpoint_template(k::Int, d::Int, D::Vector; prec::Int = ARB_PREC, 
             flush(stdout)
         end
         t0 = time()
-        Rcal[1 + m] = independentsets(n_dummy, m, D)
+        Rcal[1 + m] = independentsets(n_dummy, m, D, D_ext_rat)
         verbose && println("$(length(Rcal[1 + m])) orbits, $(round(time() - t0; digits = 1)) s")
     end
     Ucache = Dict{Tuple{Int, Int}, Tuple{Vector{Vector{arb}}, Int}}()
@@ -1126,9 +1404,111 @@ function run_example!()
     bound, alpha
 end
 
+# --- Diagnostics (28,9,0,4 investigation) ---
+
+"""Scan card×card Gram patterns; report near-singular PSD and NaN pcholesky."""
+function diagnose_D(D::Vector; k::Int = 5, card::Int = 4, eig_tol::Float64 = 1e-10)
+    D_rat_input = [Rational(a) for a in D]
+    Field = ArbField(200)
+    D_arb = [Field(a) for a in D]
+    D_ext_rat = vcat(D_rat_input, Rational(1))
+    ip = [Float64(x) for x in D_arb]
+    npairs = binomial(card, 2)
+    total = length(ip)^npairs
+    psd = near = nan_old = 0
+    nan_patterns = Int[]
+    for kidx in 0:total - 1
+        M = Matrix{Float64}(undef, card, card)
+        for i in 1:card
+            M[i, i] = 1.0
+        end
+        i = j = 1
+        for z in digits(kidx, base = length(ip), pad = npairs)
+            j += 1
+            M[i, j] = M[j, i] = ip[z + 1]
+            j == card && (i += 1; j = i)
+        end
+        try
+            cholesky(Symmetric(M))
+        catch
+            continue
+        end
+        psd += 1
+        mineig = minimum(eigvals(Symmetric(M)))
+        mineig < eig_tol && (near += 1)
+        Marb = Matrix{arb}(undef, card, card)
+        for i in 1:card
+            Marb[i, i] = one(Field)
+        end
+        i = j = 1
+        for z in digits(kidx, base = length(D_arb), pad = npairs)
+            j += 1
+            Marb[i, j] = Marb[j, i] = D_arb[z + 1]
+            j == card && (i += 1; j = i)
+        end
+        ok, F, _ = pcholesky(Marb)
+        if ok && any(!arb_isfinite(F[r, c]) for r in 1:card, c in 1:card)
+            nan_old += 1
+            push!(nan_patterns, kidx)
+        end
+    end
+    n_dummy = max(k, 1)
+    Rcal = [independentsets(n_dummy, m, D_arb, D_ext_rat) for m in 0:k]
+    orbit_fail = 0
+    for m in 1:k
+        for R in Rcal[1 + m]
+            for s in 0:(k - 2), Q in subsets(R, s)
+                findfirst(x -> orbitequal(x, Q), Rcal[1 + s]) === nothing && (orbit_fail += 1)
+            end
+        end
+    end
+    Dict(
+        :D => D_arb,
+        :k => k,
+        :card => card,
+        :psd_patterns => psd,
+        :near_singular => near,
+        :pcholesky_nan => nan_old,
+        :nan_pattern_indices => nan_patterns,
+        :orbit_counts => [length(Rcal[1 + m]) for m in 0:k],
+        :orbit_perm_failures => orbit_fail,
+        :template_ok => try
+            build_kpoint_template(k, 2, D_rat_input; verbose = false)
+            true
+        catch
+            false
+        end,
+    )
+end
+
+function diagnose_srg_280904(; which::Char = 's', k::Int = 5)
+    v, kk, lam, mu = 28, 9, 0, 4
+    disc = (lam - mu)^2 + 4(kk - mu)
+    sq = isqrt(disc)
+    r = (lam - mu + sq) ÷ 2
+    s = (lam - mu - sq) ÷ 2
+    f = (-kk - (v - 1) * s) ÷ (r - s)
+    g = v - 1 - f
+    theta, n = which == 's' ? (s, g) : (r, f)
+    D = [theta // kk, -(theta + 1) // (v - kk - 1)]
+    println("SRG($v,$kk,$lam,$mu)  projection θ=$theta ($which)  n=$n  D=$D")
+    rep = diagnose_D(D; k = k)
+    println("  PSD $(rep[:card])-point patterns (of 2^$(binomial(4,2))): ", rep[:psd_patterns])
+    println("  near-singular (min λ < 1e-10): ", rep[:near_singular])
+    println("  old pcholesky NaN patterns: ", rep[:pcholesky_nan], "  indices=", rep[:nan_pattern_indices])
+    println("  orbit counts m=0..$k: ", rep[:orbit_counts])
+    println("  orbit_perm failures (current code): ", rep[:orbit_perm_failures])
+    println("  build_kpoint_template(k=$k): ", rep[:template_ok] ? "OK" : "FAIL")
+    rep
+end
+
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    using .FastKPointBoundF
-    run_example!()
+    using .FastKPointBoundFRe1
+    if length(ARGS) >= 1 && ARGS[1] == "diagnose"
+        diagnose_srg_280904()
+    else
+        run_example!()
+    end
 end
