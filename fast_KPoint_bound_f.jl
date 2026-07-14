@@ -4,8 +4,7 @@
 #   if that fails → QQBar char-poly eigen embedding (algebraic exact).
 # get_grid_index: snap dot-products to exact D_ext (no loose tolerance).
 #
-#   julia --startup-file=no fast_KPoint_bound_f_re_1.jl diagnose
-#   julia --startup-file=no -e 'include("fast_KPoint_bound_f_re_1.jl"); using .FastKPointBoundFRe1; ...'
+#   julia --startup-file=no -e 'include("fast_KPoint_bound_f.jl"); using .FastKPointBoundFRe1; ...'
 #
 # fast_KPoint_bound_f.jl — k-point SDP bound (feasible-state quotient form)
 #
@@ -61,16 +60,16 @@ using LinearAlgebra, Nemo, Combinatorics, IterTools, Printf
 export build_kpoint_template, fill_kpoint_sdp, compress_kpoint_sdp, solve_kpoint_sdp, solve_k_point_bound
 export SDPAGMPOptions, default_sdpa_gmp_path, run_example!, KPointTemplate
 export prepare_kpoint_sdp, inspect_kpoint_sdp!, KPointBuildReport
-export diagnose_D, diagnose_srg_280904, psd_embedding
+export psd_embedding
 
 const arb = Nemo.ArbFieldElem
 
 # Default example (used when running this file directly)
-const EXAMPLE_N = 7
+const EXAMPLE_N = 33
 const EXAMPLE_K = 5
 const EXAMPLE_DEG = 5
-const EXAMPLE_INNER_A = -3 // 80
-const EXAMPLE_INNER_B = 2 // 70
+const EXAMPLE_INNER_A = -1 // 9
+const EXAMPLE_INNER_B = 7 // 27
 # Numerical defaults (see file header)
 const ARB_PREC = 2500
 const SDPA_PRECISION = 1500
@@ -151,33 +150,6 @@ function orbitequal(Q1::Vector{Vector{T}}, Q2::Vector{Vector{T}}) where T
         [dot(Q1[i], Q1[j]) for i in 1:length(Q1), j in 1:length(Q1)],
         [dot(Q2[i], Q2[j]) for i in 1:length(Q2), j in 1:length(Q2)],
     )
-end
-
-"""Pivot Cholesky for positive-definite matrices (full rank)."""
-function pcholesky(A)
-    A = deepcopy(A)
-    n = size(A, 1)
-    p = collect(1:n)
-    for k in 1:n
-        d = [A[i, i] for i in 1:n]
-        val, s = findmax(d[k:n])
-        s = s + k - 1
-        val < 0 && return false, A, p
-        if s != k
-            A[:, [k, s]] = A[:, [s, k]]
-            A[[k, s], :] = A[[s, k], :]
-            p[[k, s]] = p[[s, k]]
-        end
-        A[k, k] = sqrt(A[k, k])
-        k == n && break
-        A[k, k + 1:n] = A[k, k + 1:n] ./ A[k, k]
-        j = (k + 1):n
-        A[j, j] = A[j, j] .- A[k, j] .* transpose(A[k, j])
-    end
-    for i in 1:n, j in 1:i - 1
-        A[i, j] = zero(A[i, j])
-    end
-    true, A, p
 end
 
 """Finite check for Arb scalars."""
@@ -1404,111 +1376,9 @@ function run_example!()
     bound, alpha
 end
 
-# --- Diagnostics (28,9,0,4 investigation) ---
-
-"""Scan card×card Gram patterns; report near-singular PSD and NaN pcholesky."""
-function diagnose_D(D::Vector; k::Int = 5, card::Int = 4, eig_tol::Float64 = 1e-10)
-    D_rat_input = [Rational(a) for a in D]
-    Field = ArbField(200)
-    D_arb = [Field(a) for a in D]
-    D_ext_rat = vcat(D_rat_input, Rational(1))
-    ip = [Float64(x) for x in D_arb]
-    npairs = binomial(card, 2)
-    total = length(ip)^npairs
-    psd = near = nan_old = 0
-    nan_patterns = Int[]
-    for kidx in 0:total - 1
-        M = Matrix{Float64}(undef, card, card)
-        for i in 1:card
-            M[i, i] = 1.0
-        end
-        i = j = 1
-        for z in digits(kidx, base = length(ip), pad = npairs)
-            j += 1
-            M[i, j] = M[j, i] = ip[z + 1]
-            j == card && (i += 1; j = i)
-        end
-        try
-            cholesky(Symmetric(M))
-        catch
-            continue
-        end
-        psd += 1
-        mineig = minimum(eigvals(Symmetric(M)))
-        mineig < eig_tol && (near += 1)
-        Marb = Matrix{arb}(undef, card, card)
-        for i in 1:card
-            Marb[i, i] = one(Field)
-        end
-        i = j = 1
-        for z in digits(kidx, base = length(D_arb), pad = npairs)
-            j += 1
-            Marb[i, j] = Marb[j, i] = D_arb[z + 1]
-            j == card && (i += 1; j = i)
-        end
-        ok, F, _ = pcholesky(Marb)
-        if ok && any(!arb_isfinite(F[r, c]) for r in 1:card, c in 1:card)
-            nan_old += 1
-            push!(nan_patterns, kidx)
-        end
-    end
-    n_dummy = max(k, 1)
-    Rcal = [independentsets(n_dummy, m, D_arb, D_ext_rat) for m in 0:k]
-    orbit_fail = 0
-    for m in 1:k
-        for R in Rcal[1 + m]
-            for s in 0:(k - 2), Q in subsets(R, s)
-                findfirst(x -> orbitequal(x, Q), Rcal[1 + s]) === nothing && (orbit_fail += 1)
-            end
-        end
-    end
-    Dict(
-        :D => D_arb,
-        :k => k,
-        :card => card,
-        :psd_patterns => psd,
-        :near_singular => near,
-        :pcholesky_nan => nan_old,
-        :nan_pattern_indices => nan_patterns,
-        :orbit_counts => [length(Rcal[1 + m]) for m in 0:k],
-        :orbit_perm_failures => orbit_fail,
-        :template_ok => try
-            build_kpoint_template(k, 2, D_rat_input; verbose = false)
-            true
-        catch
-            false
-        end,
-    )
-end
-
-function diagnose_srg_280904(; which::Char = 's', k::Int = 5)
-    v, kk, lam, mu = 28, 9, 0, 4
-    disc = (lam - mu)^2 + 4(kk - mu)
-    sq = isqrt(disc)
-    r = (lam - mu + sq) ÷ 2
-    s = (lam - mu - sq) ÷ 2
-    f = (-kk - (v - 1) * s) ÷ (r - s)
-    g = v - 1 - f
-    theta, n = which == 's' ? (s, g) : (r, f)
-    D = [theta // kk, -(theta + 1) // (v - kk - 1)]
-    println("SRG($v,$kk,$lam,$mu)  projection θ=$theta ($which)  n=$n  D=$D")
-    rep = diagnose_D(D; k = k)
-    println("  PSD $(rep[:card])-point patterns (of 2^$(binomial(4,2))): ", rep[:psd_patterns])
-    println("  near-singular (min λ < 1e-10): ", rep[:near_singular])
-    println("  old pcholesky NaN patterns: ", rep[:pcholesky_nan], "  indices=", rep[:nan_pattern_indices])
-    println("  orbit counts m=0..$k: ", rep[:orbit_counts])
-    println("  orbit_perm failures (current code): ", rep[:orbit_perm_failures])
-    println("  build_kpoint_template(k=$k): ", rep[:template_ok] ? "OK" : "FAIL")
-    rep
-end
-
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
     using .FastKPointBoundFRe1
-    if length(ARGS) >= 1 && ARGS[1] == "diagnose"
-        diagnose_srg_280904()
-    else
-        run_example!()
-    end
+    run_example!()
 end
